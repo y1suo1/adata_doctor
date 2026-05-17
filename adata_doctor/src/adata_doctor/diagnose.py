@@ -1,0 +1,387 @@
+from __future__ import annotations
+
+from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
+import scipy.sparse as sp
+
+from .models import MatrixDiagnosis
+from .utils import choose_indices, matrix_type_name, safe_dtype_name, safe_to_float_array
+
+
+def diagnose_matrix(
+    matrix: Any,
+    *,
+    name: str,
+    sample_cells: int = 256,
+    sample_genes: Optional[int] = None,
+    target_sum: float = 1e4,
+    seed: int = 0,
+    rel_tol: float = 0.15,
+    abs_tol: float = 50,
+) -> MatrixDiagnosis:
+    """Heuristically diagnose one expression matrix.
+
+    The goal is not mathematical certainty. The goal is to provide a fast,
+    explainable pre-check before downstream analysis.
+    """
+    warnings: List[str] = []
+    evidence: List[str] = []
+
+    shape = getattr(matrix, "shape", None)
+    if shape is None or len(shape) != 2:
+        return MatrixDiagnosis(
+            name=name,
+            verdict="invalid_matrix",
+            confidence=1.0,
+            advice="该对象不是二维矩阵，不能作为表达矩阵诊断。",
+            warnings=["Matrix has no valid 2D shape."],
+            stats={"type": type(matrix).__name__},
+        )
+
+    n_obs, n_vars = int(shape[0]), int(shape[1])
+    if n_obs == 0 or n_vars == 0:
+        return MatrixDiagnosis(
+            name=name,
+            verdict="empty_matrix",
+            confidence=1.0,
+            advice="矩阵为空，不能用于下游单细胞分析。",
+            warnings=["Matrix has zero cells or zero genes."],
+            stats={"shape": [n_obs, n_vars], "type": matrix_type_name(matrix)},
+        )
+
+    row_idx = choose_indices(n_obs, sample_cells, seed)
+    value_gene_idx = None
+    if sample_genes is not None:
+        value_gene_idx = choose_indices(n_vars, sample_genes, seed + 1)
+
+    # Row sums use all genes for sampled cells. This is important for detecting
+    # normalize_total(target_sum) and log1p-normalized target_sum after expm1.
+    X_rows = matrix[row_idx, :]
+    row_sum = _row_sum(X_rows)
+
+    # Value-level statistics can optionally use sampled genes to reduce memory.
+    if value_gene_idx is not None and len(value_gene_idx) < n_vars:
+        X_values = X_rows[:, value_gene_idx]
+    else:
+        X_values = X_rows
+
+    X_dense = safe_to_float_array(X_values)
+
+    if X_dense.size == 0:
+        return MatrixDiagnosis(
+            name=name,
+            verdict="empty_sample",
+            confidence=1.0,
+            advice="抽样后矩阵为空，请检查输入。",
+            warnings=["Sampled matrix is empty."],
+            stats={"shape": [n_obs, n_vars]},
+        )
+
+    finite_mask = np.isfinite(X_dense)
+    finite_ratio = float(finite_mask.mean())
+    if finite_ratio < 1.0:
+        warnings.append("矩阵含有 NaN 或 Inf，很多下游流程会失败。")
+
+    finite_values = X_dense[finite_mask]
+    if finite_values.size == 0:
+        return MatrixDiagnosis(
+            name=name,
+            verdict="non_finite_matrix",
+            confidence=1.0,
+            advice="矩阵抽样值全部不是有限数值，请先修复 NaN/Inf。",
+            warnings=warnings,
+            stats={"finite_ratio": finite_ratio},
+        )
+
+    min_x = float(np.min(finite_values))
+    max_x = float(np.max(finite_values))
+    mean_x = float(np.mean(finite_values))
+    nonzero_ratio = float(np.count_nonzero(X_dense) / X_dense.size)
+
+    if sp.issparse(X_values):
+        nz_values = np.asarray(X_values.data, dtype=np.float64)
+        nz_values = nz_values[np.isfinite(nz_values)]
+    else:
+        nz_values = finite_values[finite_values != 0]
+
+    if nz_values.size > 0:
+        int_like_ratio = float(np.isclose(nz_values, np.round(nz_values), atol=1e-6).mean())
+    else:
+        int_like_ratio = float("nan")
+        warnings.append("抽样矩阵几乎全为 0，难以判断矩阵状态。")
+
+    row_sum = np.asarray(row_sum, dtype=np.float64)
+    row_sum_finite = row_sum[np.isfinite(row_sum)]
+    row_sum_mean = float(np.mean(row_sum_finite)) if row_sum_finite.size else float("nan")
+    row_sum_median = float(np.median(row_sum_finite)) if row_sum_finite.size else float("nan")
+    row_sum_close = _close_ratio(row_sum_finite, target_sum, rel_tol, abs_tol)
+
+    # expm1 row sums use all genes for sampled cells. If X is log1p-normalized,
+    # expm1(X).sum(axis=1) should be close to the target_sum.
+    expm1_overflow, expm1_sum, expm1_warnings = _expm1_row_sum(X_rows)
+    warnings.extend(expm1_warnings)
+    if expm1_overflow or expm1_sum is None:
+        expm1_sum_mean = float("nan")
+        expm1_sum_median = float("nan")
+        expm1_sum_close = float("nan")
+    else:
+        expm1_sum = np.asarray(expm1_sum, dtype=np.float64)
+        expm1_sum_finite = expm1_sum[np.isfinite(expm1_sum)]
+        expm1_sum_mean = float(np.mean(expm1_sum_finite)) if expm1_sum_finite.size else float("nan")
+        expm1_sum_median = float(np.median(expm1_sum_finite)) if expm1_sum_finite.size else float("nan")
+        expm1_sum_close = _close_ratio(expm1_sum_finite, target_sum, rel_tol, abs_tol)
+
+    expm1_int_like_ratio = _expm1_int_like_ratio(nz_values)
+
+    stats: Dict[str, Any] = {
+        "shape": [n_obs, n_vars],
+        "type": matrix_type_name(matrix),
+        "dtype": safe_dtype_name(matrix),
+        "sampled_cells": int(len(row_idx)),
+        "sampled_genes_for_value_stats": int(len(value_gene_idx)) if value_gene_idx is not None else int(n_vars),
+        "target_sum": float(target_sum),
+        "finite_ratio": finite_ratio,
+        "min": min_x,
+        "max": max_x,
+        "mean": mean_x,
+        "nonzero_ratio": nonzero_ratio,
+        "int_like_ratio_nonzero": int_like_ratio,
+        "row_sum_mean": row_sum_mean,
+        "row_sum_median": row_sum_median,
+        "row_sum_close_to_target_ratio": row_sum_close,
+        "expm1_sum_mean": expm1_sum_mean,
+        "expm1_sum_median": expm1_sum_median,
+        "expm1_sum_close_to_target_ratio": expm1_sum_close,
+        "expm1_int_like_ratio_nonzero": expm1_int_like_ratio,
+        "expm1_overflow": bool(expm1_overflow),
+    }
+
+    verdict, confidence, advice, more_evidence, more_warnings = _classify(
+        min_x=min_x,
+        max_x=max_x,
+        mean_x=mean_x,
+        finite_ratio=finite_ratio,
+        int_like_ratio=int_like_ratio,
+        row_sum_close=row_sum_close,
+        expm1_sum_close=expm1_sum_close,
+        expm1_overflow=expm1_overflow,
+        expm1_int_like_ratio=expm1_int_like_ratio,
+        nonzero_ratio=nonzero_ratio,
+    )
+    evidence.extend(more_evidence)
+    warnings.extend(more_warnings)
+
+    return MatrixDiagnosis(
+        name=name,
+        verdict=verdict,
+        confidence=confidence,
+        advice=advice,
+        evidence=evidence,
+        warnings=warnings,
+        stats=stats,
+    )
+
+
+def _row_sum(x: Any) -> np.ndarray:
+    if sp.issparse(x):
+        return np.asarray(x.sum(axis=1)).ravel()
+    return np.asarray(x).sum(axis=1)
+
+
+def _close_ratio(values: np.ndarray, target: float, rel_tol: float, abs_tol: float) -> float:
+    if values.size == 0:
+        return float("nan")
+    return float(np.isclose(values, target, rtol=rel_tol, atol=abs_tol).mean())
+
+
+def _expm1_row_sum(x: Any) -> Tuple[bool, Optional[np.ndarray], List[str]]:
+    warnings: List[str] = []
+    try:
+        if sp.issparse(x):
+            x_csr = x.tocsr(copy=True)
+            with np.errstate(over="ignore", invalid="ignore"):
+                x_csr.data = np.expm1(x_csr.data.astype(np.float64, copy=False))
+            if not np.isfinite(x_csr.data).all():
+                return True, None, ["expm1(X) 出现 Inf/NaN，说明矩阵数值过大或并非 log1p 矩阵。"]
+            return False, np.asarray(x_csr.sum(axis=1)).ravel(), warnings
+        arr = np.asarray(x, dtype=np.float64)
+        with np.errstate(over="ignore", invalid="ignore"):
+            expm1_arr = np.expm1(arr)
+        if not np.isfinite(expm1_arr).all():
+            return True, None, ["expm1(X) 出现 Inf/NaN，说明矩阵数值过大或并非 log1p 矩阵。"]
+        return False, expm1_arr.sum(axis=1), warnings
+    except MemoryError:
+        return True, None, ["计算 expm1 行和时内存不足，已跳过该指标。"]
+
+
+def _expm1_int_like_ratio(values: np.ndarray, atol: float = 1e-5) -> float:
+    """Check whether expm1(nonzero values) looks integer-like.
+
+    This is useful for detecting matrices like log1p(raw counts):
+    the matrix itself is not integer-like, but expm1(X) is integer-like.
+    """
+    if values.size == 0:
+        return float("nan")
+    with np.errstate(over="ignore", invalid="ignore"):
+        exp_values = np.expm1(values.astype(np.float64, copy=False))
+    exp_values = exp_values[np.isfinite(exp_values)]
+    if exp_values.size == 0:
+        return float("nan")
+    return float(np.isclose(exp_values, np.round(exp_values), atol=atol).mean())
+
+
+def _classify(
+    *,
+    min_x: float,
+    max_x: float,
+    mean_x: float,
+    finite_ratio: float,
+    int_like_ratio: float,
+    row_sum_close: float,
+    expm1_sum_close: float,
+    expm1_overflow: bool,
+    expm1_int_like_ratio: float,
+    nonzero_ratio: float,
+) -> Tuple[str, float, str, List[str], List[str]]:
+    evidence: List[str] = []
+    warnings: List[str] = []
+
+    if finite_ratio < 0.99:
+        return (
+            "invalid_or_corrupted_matrix",
+            0.95,
+            "矩阵存在较多 NaN/Inf，建议先清洗或重新读取数据。",
+            [f"finite_ratio={finite_ratio:.3f} < 0.99"],
+            warnings,
+        )
+
+    if min_x < 0:
+        evidence.append(f"min(X)={min_x:.4g} < 0")
+        if max_x <= 20 and abs(mean_x) < 5:
+            return (
+                "scaled_or_other_transformed_matrix",
+                0.90,
+                "矩阵含负值，通常不是 raw counts，也不是普通 log1p-normalized 数据；不要直接 normalize/log1p，先寻找 counts layer。",
+                evidence,
+                warnings,
+            )
+        return (
+            "other_transformed_matrix",
+            0.85,
+            "矩阵含负值，不适合当作 raw counts 或普通 log1p 表达矩阵直接使用。",
+            evidence,
+            warnings,
+        )
+
+    if (
+        min_x >= 0
+        and max_x <= 12
+        and (not expm1_overflow)
+        and (not np.isnan(expm1_int_like_ratio))
+        and expm1_int_like_ratio >= 0.95
+        and (np.isnan(expm1_sum_close) or expm1_sum_close < 0.20)
+        and (np.isnan(row_sum_close) or row_sum_close < 0.20)
+    ):
+        evidence.extend([
+            f"max(X)={max_x:.4g} <= 12",
+            f"expm1(X) nonzero integer-like ratio={expm1_int_like_ratio:.3f} >= 0.95",
+            f"expm1(X) row sums close to target ratio={expm1_sum_close:.3f} < 0.20",
+        ])
+        warnings.append("expm1(X) 很像整数 counts，但每细胞总量不接近 target_sum；可能没有做 normalize_total。")
+        return (
+            "log1p_counts_not_normalized",
+            0.88,
+            "大概率是 log1p(raw counts) 或未按 target_sum 归一化的 log counts；如需标准下游输入，可先 expm1 还原为 counts，再 normalize_total(target_sum)+log1p。",
+            evidence,
+            warnings,
+        )
+
+    if max_x <= 12 and (not expm1_overflow) and expm1_sum_close >= 0.80:
+        evidence.extend([
+            f"max(X)={max_x:.4g} <= 12",
+            f"expm1(X) row sums close to target ratio={expm1_sum_close:.3f}",
+        ])
+        return (
+            "log1p_normalized_to_target_sum",
+            min(0.98, 0.80 + 0.20 * expm1_sum_close),
+            "大概率已经是 log1p + normalize_total(target_sum) 数据；下游不要再次 normalize_total 或 log1p。",
+            evidence,
+            warnings,
+        )
+
+    if row_sum_close >= 0.80 and (not np.isnan(int_like_ratio)) and int_like_ratio < 0.95:
+        evidence.extend([
+            f"row sums close to target ratio={row_sum_close:.3f}",
+            f"nonzero integer-like ratio={int_like_ratio:.3f} < 0.95",
+        ])
+        return (
+            "normalized_to_target_sum_not_log1p",
+            min(0.95, 0.75 + 0.20 * row_sum_close),
+            "大概率已经 normalize_total(target_sum)，但还没有 log1p；下游通常只需要 log1p。",
+            evidence,
+            warnings,
+        )
+
+    if (not np.isnan(int_like_ratio)) and int_like_ratio >= 0.95 and max_x > 12 and row_sum_close < 0.20:
+        evidence.extend([
+            f"nonzero integer-like ratio={int_like_ratio:.3f} >= 0.95",
+            f"max(X)={max_x:.4g} > 12",
+            f"row sums close to target ratio={row_sum_close:.3f} < 0.20",
+        ])
+        return (
+            "raw_counts",
+            min(0.97, 0.80 + 0.17 * int_like_ratio),
+            "大概率是原始 counts；常规流程可先 normalize_total(target_sum)，再 log1p。",
+            evidence,
+            warnings,
+        )
+
+    if max_x <= 12 and (not expm1_overflow) and expm1_sum_close >= 0.50:
+        evidence.extend([
+            f"max(X)={max_x:.4g} <= 12",
+            f"expm1(X) row sums partly close to target ratio={expm1_sum_close:.3f}",
+        ])
+        warnings.append("log1p 证据不够强，可能是过滤、子集化或 target_sum 不是 1e4 导致。")
+        return (
+            "probably_log1p_normalized",
+            0.65,
+            "较可能是 log1p-normalized 数据；建议结合 uns['log1p']、layers 和数据来源复核。",
+            evidence,
+            warnings,
+        )
+
+    if (not np.isnan(int_like_ratio)) and int_like_ratio >= 0.90 and max_x > 12:
+        evidence.extend([
+            f"nonzero integer-like ratio={int_like_ratio:.3f} >= 0.90",
+            f"max(X)={max_x:.4g} > 12",
+        ])
+        warnings.append("raw counts 证据较强但不绝对，可能存在少量非整数或处理痕迹。")
+        return (
+            "probably_raw_counts",
+            0.70,
+            "较可能是 raw counts；若用于常规 Scanpy/CellTypist 流程，通常需要 normalize_total + log1p。",
+            evidence,
+            warnings,
+        )
+
+    if nonzero_ratio > 0.5 and max_x <= 20:
+        evidence.extend([
+            f"nonzero_ratio={nonzero_ratio:.3f} is high",
+            f"max(X)={max_x:.4g} <= 20",
+        ])
+        return (
+            "possibly_log_or_dense_transformed",
+            0.55,
+            "可能是某种 log/归一化后的 dense-like 矩阵，但证据不足；建议检查 layers 或原始论文说明。",
+            evidence,
+            warnings,
+        )
+
+    return (
+        "ambiguous",
+        0.40,
+        "无法稳妥自动判定；建议结合数据来源、layers、raw 和预处理记录人工复核。",
+        evidence,
+        warnings,
+    )

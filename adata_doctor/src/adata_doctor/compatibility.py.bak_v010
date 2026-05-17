@@ -1,0 +1,83 @@
+from __future__ import annotations
+
+from typing import Any, Dict
+
+from .models import MatrixDiagnosis
+
+
+def build_compatibility(
+    matrices: Dict[str, MatrixDiagnosis], summary: Dict[str, Any]
+) -> Dict[str, Dict[str, str]]:
+    """Generate simple downstream recommendations."""
+    x = matrices.get("X")
+    raw_candidates = [name for name, d in matrices.items() if d.verdict in {"raw_counts", "probably_raw_counts"}]
+    log_candidates = [
+        name
+        for name, d in matrices.items()
+        if d.verdict in {"log1p_normalized_to_target_sum", "probably_log1p_normalized"}
+    ]
+
+    result: Dict[str, Dict[str, str]] = {}
+
+    if x is None:
+        result["general"] = {
+            "status": "fail",
+            "recommendation": "没有可诊断的 X 矩阵。",
+        }
+        return result
+
+    if x.verdict == "log1p_normalized_to_target_sum":
+        result["celltypist_like_input"] = {
+            "status": "pass",
+            "recommendation": "X 看起来已经是 log1p-normalized；可直接用于需要 log1p normalized 输入的流程。",
+        }
+    elif x.verdict == "raw_counts":
+        result["celltypist_like_input"] = {
+            "status": "needs_preprocessing",
+            "recommendation": "X 看起来是 raw counts；通常需要 normalize_total 后再 log1p。",
+        }
+    elif x.verdict in {"scaled_or_other_transformed_matrix", "other_transformed_matrix"}:
+        result["celltypist_like_input"] = {
+            "status": "fail_or_caution",
+            "recommendation": "X 含负值或已被转换，不建议直接作为表达矩阵输入；优先寻找 counts/log-normalized layer。",
+        }
+    else:
+        result["celltypist_like_input"] = {
+            "status": "caution",
+            "recommendation": "X 状态不够明确，建议结合 layers/raw 与数据来源复核。",
+        }
+
+    if raw_candidates:
+        result["renormalization"] = {
+            "status": "pass",
+            "recommendation": f"发现可能的 raw counts 矩阵：{', '.join(raw_candidates)}；可用于重新标准化。",
+        }
+    else:
+        result["renormalization"] = {
+            "status": "caution",
+            "recommendation": "未发现明确 raw counts；如果需要从原始 counts 重新处理，建议回到数据源确认。",
+        }
+
+    if log_candidates:
+        result["visualization_or_marker_plot"] = {
+            "status": "pass",
+            "recommendation": f"发现可能的 log-normalized 矩阵：{', '.join(log_candidates)}；通常适合表达量可视化。",
+        }
+    else:
+        result["visualization_or_marker_plot"] = {
+            "status": "caution",
+            "recommendation": "未发现明确 log-normalized 矩阵；作图前需要确认是否已经 normalize/log1p。",
+        }
+
+    if summary.get("has_raw") or raw_candidates:
+        result["traceability"] = {
+            "status": "pass",
+            "recommendation": "存在 raw 或 raw-like layer，数据处理可追溯性较好。",
+        }
+    else:
+        result["traceability"] = {
+            "status": "caution",
+            "recommendation": "缺少 raw/raw-like 矩阵，后续解释和复现需要谨慎。",
+        }
+
+    return result
