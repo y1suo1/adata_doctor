@@ -1,8 +1,15 @@
 
+### 中文简介
 
-# `adata_doctor` 项目报告
+```text
+adata_doctor 是一个用于单细胞 AnnData 表达矩阵预检查的轻量级 Python 工具。
+它可以在下游分析前自动判断 .X、.raw.X 和 layers 中矩阵的状态，
+识别 raw counts、log-normalized matrix、log1p(raw counts)、scaled matrix 等常见情况，
+并生成结构化诊断报告，帮助用户避免重复归一化、错误 log 转换和错误下游输入。
+```
+# `adata_doctor` 工具
 
-## 1. 项目基本信息
+## 1. 基本信息
 
 **项目名称：** `adata_doctor`
 **项目定位：** AnnData 表达矩阵状态自动诊断工具
@@ -24,7 +31,7 @@ Python 导入名：adata_doctor
 
 ---
 
-## 2. 项目背景
+## 2. 背景
 
 在单细胞 RNA-seq 数据分析中，表达矩阵的状态决定了后续分析流程是否正确。一个 AnnData 文件中，表达数据可能存放在：
 
@@ -66,7 +73,7 @@ adata.layers["scale.data"]
 
 ---
 
-## 3. 项目目标
+## 3. 目标
 
 `adata_doctor` 的目标不是替代 Scanpy、CellTypist 或 Seurat，而是成为这些工具之前的一个**矩阵体检工具**。
 
@@ -787,78 +794,9 @@ pytest 测试
 
 ---
 
-## 12. 当前局限性
 
-当前版本仍然是一个基于规则和统计特征的诊断工具，因此存在一定局限：
 
-```text
-1. 不能百分之百替代人工判断；
-2. 对特殊归一化方法或批次校正矩阵可能给出 ambiguous；
-3. 对经过复杂模型校正的数据识别能力有限；
-4. 当前主要支持 AnnData/h5ad，对 mtx、csv、10x h5 支持有限；
-5. 当前报告以文本、Markdown、JSON 为主，尚无 HTML 可视化报告；
-6. 当前仍处于早期版本，需要更多真实公开数据测试。
-```
-
-因此，`adata_doctor` 的定位应当是：
-
-```text
-快速预检工具，而不是绝对判定器。
-```
-
----
-
-## 13. 后续开发计划
-
-后续版本可以从以下方向继续完善：
-
-```text
-1. 支持 10x mtx、10x h5、csv 输入；
-2. 自动识别常见 counts layer 名称；
-3. 增加 check_celltypist() 专项检查；
-4. 增加 check_scanpy_workflow()；
-5. 检查 obs 中的 batch、sample、condition、cell_type 字段；
-6. 检查 var 中的 gene symbol、Ensembl ID、重复基因名；
-7. 支持 HTML 报告；
-8. 支持更好的 backed AnnData 模式；
-9. 增加更多真实公开数据测试案例；
-10. 建立英文文档和 GitHub Pages 文档站点。
-```
-
----
-
-## 14. 推荐 GitHub / PyPI 项目简介
-
-### 中文简介
-
-```text
-adata_doctor 是一个用于单细胞 AnnData 表达矩阵预检查的轻量级 Python 工具。
-它可以在下游分析前自动判断 .X、.raw.X 和 layers 中矩阵的状态，
-识别 raw counts、log-normalized matrix、log1p(raw counts)、scaled matrix 等常见情况，
-并生成结构化诊断报告，帮助用户避免重复归一化、错误 log 转换和错误下游输入。
-```
-
-### English description
-
-```text
-adata_doctor is a lightweight Python diagnostic tool for inspecting expression matrix states in AnnData objects before downstream single-cell analysis. It helps identify raw counts, log-normalized matrices, log1p-transformed counts, scaled matrices, and other transformed matrix states in .X, .raw.X, and layers, and generates structured diagnostic reports.
-```
-
-### 推荐短标语
-
-```text
-Check your AnnData before analysis.
-```
-
-或者：
-
-```text
-A lightweight doctor for AnnData expression matrices.
-```
-
----
-
-## 15. 项目总结
+## 15. 总结
 
 `adata_doctor` 面向单细胞公开数据复用中的一个基础但重要的问题：AnnData 中表达矩阵状态不透明。
 
